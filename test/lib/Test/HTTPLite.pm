@@ -521,6 +521,97 @@ sub _echo_handle {
     $client->close;
 }
 
+# Upstream backend that replies with bodyless statuses.
+#
+# Routes by request path so a single backend can exercise both codes:
+#   GET /204  -> 204 No Content
+#   GET /304  -> 304 Not Modified
+# Both replies omit Content-Length and carry no body (RFC 9110), which is
+# exactly the framing case httplite must accept without a 503.
+sub status_daemon {
+    my ($port) = @_;
+
+    my $server = IO::Socket::INET->new(
+        LocalAddr => '127.0.0.1',
+        LocalPort => $port,
+        Proto     => 'tcp',
+        Listen    => 128,
+        ReuseAddr => 1,
+        ReusePort => 1,
+    ) or die "status_daemon: cannot bind port $port: $!";
+
+    while (my $client = $server->accept()) {
+        my $pid = fork();
+        next if $pid;  # parent continues accepting
+
+        if (!defined $pid) {
+            _status_handle($client);
+            exit(0);
+        }
+
+        # child
+        $server->close;
+        $SIG{PIPE} = 'IGNORE';
+        _status_handle($client);
+        exit(0);
+    }
+}
+
+sub _status_handle {
+    my ($client) = @_;
+
+    $client->autoflush(1);
+
+    my $sel = IO::Select->new($client);
+    my $buf = '';
+
+    while (1) {
+        my @ready = $sel->can_read(2);
+        last unless @ready;
+        my $data;
+        my $n = $client->sysread($data, 65536);
+        last if !defined $n || $n == 0;
+        $buf .= $data;
+
+        # Process all complete requests in buffer (headers + Content-Length body)
+        while ($buf =~ /\r\n\r\n/) {
+            my $hdr_end = index($buf, "\r\n\r\n");
+            my $headers = substr($buf, 0, $hdr_end);
+            my $body_start = $hdr_end + 4;
+
+            my $content_length = 0;
+            if ($headers =~ /Content-Length:\s*(\d+)/i) {
+                $content_length = $1;
+            }
+
+            my $total_needed = $body_start + $content_length;
+            last if length($buf) < $total_needed;
+
+            $buf = substr($buf, $total_needed);
+
+            # Pick the status from the request path.
+            my ($path) = $headers =~ m{^\S+\s+(\S+)};
+            $path //= '';
+
+            my $resp;
+            if ($path =~ m{/304}) {
+                $resp = "HTTP/1.1 304 Not Modified\r\n"
+                      . "Connection: keep-alive\r\n"
+                      . "\r\n";
+            } else {
+                # default to 204 No Content
+                $resp = "HTTP/1.1 204 No Content\r\n"
+                      . "Connection: keep-alive\r\n"
+                      . "\r\n";
+            }
+
+            $client->syswrite($resp) or last;
+        }
+    }
+
+    $client->close;
+}
+
 # --- Cleanup --------------------------------------------------------------
 
 sub DESTROY {
