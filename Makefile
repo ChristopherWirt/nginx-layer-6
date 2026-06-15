@@ -18,11 +18,11 @@ all: test
 build: $(OUT_BIN)
 
 # Download and unpack nginx source if NGINX_DIR is missing
+# The tarball extracts to nginx-$(NGINX_VERSION), which is already $(NGINX_DIR).
 $(NGINX_DIR)/configure:
 	curl -fsSL $(NGINX_URL) -o nginx-$(NGINX_VERSION).tar.gz
 	tar xzf nginx-$(NGINX_VERSION).tar.gz
 	rm nginx-$(NGINX_VERSION).tar.gz
-	mv nginx-$(NGINX_VERSION) $(NGINX_DIR)
 
 # Auto-configure if objs/Makefile doesn't exist yet
 $(NGINX_DIR)/objs/Makefile: config $(NGINX_DIR)/configure
