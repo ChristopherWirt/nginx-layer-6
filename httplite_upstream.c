@@ -781,6 +781,11 @@ void httplite_upstream_write_handler(ngx_event_t *wev) {
 
     if (n == NGX_ERROR) {
         ngx_log_error(NGX_LOG_WARN, wev->log, 0, "unable to send request to upstream %s!", u->peer.name->data);
+        /* The upstream connection failed while forwarding the request. Every
+         * other upstream-failure path replies to the waiting client with a
+         * 503; without this, the client receives nothing and blocks until its
+         * own read timeout (observed as an empty response under load). */
+        httplite_send_client_error(ev_data->client, HTTP_INACTIVE_UPSTREAM_RESPONSE);
         httplite_deactivate_upstream(u);
         return;
     }
