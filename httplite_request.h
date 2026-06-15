@@ -27,6 +27,10 @@ typedef struct httplite_client_data_s {
 
     /* Response handling */
     struct httplite_upstream_s *response_upstream;  /* Upstream currently sending response to this client */
+
+    /* Pending error response (when the client was not write-ready) */
+    u_char *pending_error;                          /* Error message bytes to send once writable */
+    size_t  pending_error_len;                      /* Length of pending_error (no NUL dependency) */
 } httplite_client_data_t;
 
 /* ------------------------------------------------------------------------------

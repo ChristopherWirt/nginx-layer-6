@@ -292,11 +292,11 @@ void httplite_send_client_error(ngx_connection_t *client, char *message) {
         return;
     }
 
-    int length = strlen(message);
-    
+    size_t length = strlen(message);
+
     if (client->write->ready) {
         int n = client->send(client, (u_char *) message, length);
-        
+
         if (n == NGX_ERROR) {
             ngx_log_error(NGX_LOG_ALERT, client->log, 0, "unable to send error response to client!");
         }
@@ -305,19 +305,37 @@ void httplite_send_client_error(ngx_connection_t *client, char *message) {
         return;
     }
 
-    client->data = ngx_pcalloc(client->pool, length);
-    memcpy(client->data, message, length);
+    /*
+     * Client is not write-ready: stash the message on the client data so the
+     * write handler can flush it. Must NOT overwrite client->data itself — that
+     * is the httplite_client_data_t struct (read_list/write_list/...), and the
+     * response path still dereferences it.
+     */
+    httplite_client_data_t *client_data = client->data;
+    if (client_data == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, client->log, 0,
+                      "no client data while deferring error response!");
+        return;
+    }
+
+    client_data->pending_error = ngx_pnalloc(client->pool, length);
+    if (client_data->pending_error == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, client->log, 0,
+                      "unable to allocate pending error response!");
+        return;
+    }
+    ngx_memcpy(client_data->pending_error, message, length);
+    client_data->pending_error_len = length;
 
     client->write->handler = httplite_send_client_error_handler;
 }
 
 void httplite_send_client_error_handler(ngx_event_t *wev) {
     ngx_connection_t *client;
-    char *message;
+    httplite_client_data_t *client_data;
     int n;
 
     client = wev->data;
-    message = client->data;
 
     if (httplite_check_broken_connection(client) != NGX_OK) {
         ngx_log_debug0(NGX_LOG_WARN, client->log, 0, "Client was closed during error handling.");
@@ -335,9 +353,11 @@ void httplite_send_client_error_handler(ngx_event_t *wev) {
         return;
     }
 
+    client_data = client->data;
+
     wev->handler = httplite_empty_handler;
 
-    n = client->send(client, (u_char *) message, strlen(message));
+    n = client->send(client, client_data->pending_error, client_data->pending_error_len);
     client->write->handler = httplite_empty_handler;
 
     if (n == NGX_ERROR) {
