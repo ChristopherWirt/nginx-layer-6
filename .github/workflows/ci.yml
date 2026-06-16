@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build & test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libpcre3-dev \
+            zlib1g-dev \
+            libwww-perl
+
+      - name: Cache nginx source tree
+        uses: actions/cache@v4
+        with:
+          path: nginx-1.22.1
+          key: nginx-src-1.22.1
+
+      - name: Build and run integration tests
+        run: make test

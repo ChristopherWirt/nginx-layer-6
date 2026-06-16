@@ -83,6 +83,8 @@ httplite_upstream_t *httplite_create_upstream(ngx_pool_t *pool, ngx_array_t *arr
     u->pending_active = 0;
     u->busy = 0;
     u->keep_alive = 0;
+    u->resp_headers_done = 0;
+    u->resp_body_remaining = 0;
     u->request = NULL;
     u->response = NULL;
     u->timer = ngx_pcalloc(pool, sizeof(ngx_event_t));
@@ -158,6 +160,8 @@ int httplite_send_request_to_upstream(httplite_request_list_t *request) {
     u->pending_active = 0;
     u->busy = 1;
     u->request = request;
+    u->resp_headers_done = 0;
+    u->resp_body_remaining = 0;
 
     TRACEME(
         "  receieved upstream: %p\n"
@@ -220,9 +224,11 @@ int httplite_fetch_upstream_and_send_request(httplite_request_list_t *request) {
 
     u->pending_active = 1;
     u->busy = 1;
-    
+
     u->request = request;
     u->keep_alive = cucf->keep_alive;
+    u->resp_headers_done = 0;
+    u->resp_body_remaining = 0;
 
     TRACEME(
         "  receieved upstream: %p\n"
@@ -292,11 +298,11 @@ void httplite_send_client_error(ngx_connection_t *client, char *message) {
         return;
     }
 
-    int length = strlen(message);
-    
+    size_t length = strlen(message);
+
     if (client->write->ready) {
         int n = client->send(client, (u_char *) message, length);
-        
+
         if (n == NGX_ERROR) {
             ngx_log_error(NGX_LOG_ALERT, client->log, 0, "unable to send error response to client!");
         }
@@ -305,19 +311,37 @@ void httplite_send_client_error(ngx_connection_t *client, char *message) {
         return;
     }
 
-    client->data = ngx_pcalloc(client->pool, length);
-    memcpy(client->data, message, length);
+    /*
+     * Client is not write-ready: stash the message on the client data so the
+     * write handler can flush it. Must NOT overwrite client->data itself — that
+     * is the httplite_client_data_t struct (read_list/write_list/...), and the
+     * response path still dereferences it.
+     */
+    httplite_client_data_t *client_data = client->data;
+    if (client_data == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, client->log, 0,
+                      "no client data while deferring error response!");
+        return;
+    }
+
+    client_data->pending_error = ngx_pnalloc(client->pool, length);
+    if (client_data->pending_error == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, client->log, 0,
+                      "unable to allocate pending error response!");
+        return;
+    }
+    ngx_memcpy(client_data->pending_error, message, length);
+    client_data->pending_error_len = length;
 
     client->write->handler = httplite_send_client_error_handler;
 }
 
 void httplite_send_client_error_handler(ngx_event_t *wev) {
     ngx_connection_t *client;
-    char *message;
+    httplite_client_data_t *client_data;
     int n;
 
     client = wev->data;
-    message = client->data;
 
     if (httplite_check_broken_connection(client) != NGX_OK) {
         ngx_log_debug0(NGX_LOG_WARN, client->log, 0, "Client was closed during error handling.");
@@ -335,9 +359,11 @@ void httplite_send_client_error_handler(ngx_event_t *wev) {
         return;
     }
 
+    client_data = client->data;
+
     wev->handler = httplite_empty_handler;
 
-    n = client->send(client, (u_char *) message, strlen(message));
+    n = client->send(client, client_data->pending_error, client_data->pending_error_len);
     client->write->handler = httplite_empty_handler;
 
     if (n == NGX_ERROR) {
@@ -443,6 +469,97 @@ void httplite_keepalive_write_handler(ngx_event_t *wev) {
     }
 }
 
+#define RESP_LENGTH_HEADER "\nContent-Length: "
+#define HEADER_BODY_SEPARATOR "\r\n\r\n"
+#define HEADER_BODY_SEPARATOR_SIZE (sizeof(HEADER_BODY_SEPARATOR) - 1)
+
+/*
+ * Account for response framing on a freshly-recv'd response slab.
+ *
+ * On the first slab of a response, parse the header block (mirroring the
+ * request-side parser in httplite_request.c): locate the "\r\n\r\n" separator
+ * and the Content-Length, then set resp_body_remaining to the body bytes not
+ * yet present in this slab. On subsequent slabs the headers are already done,
+ * so every byte is body and is subtracted from resp_body_remaining.
+ *
+ * 204 No Content and 304 Not Modified responses carry no body by definition
+ * (RFC 9110) and routinely omit Content-Length, so they are framed by their
+ * status code alone. Every other status requires a valid Content-Length;
+ * chunked / close-delimited responses are not supported.
+ *
+ * The slab buffer must be allocated SLAB_SIZE+1 and NUL-terminated by the
+ * caller so ngx_strstr does not read past it. Returns NGX_OK, or NGX_ERROR on
+ * a framing error (no separator within one slab, or missing/invalid
+ * Content-Length).
+ */
+static ngx_int_t
+httplite_account_response_bytes(httplite_upstream_t *u,
+                                httplite_request_slab_t *slab)
+{
+    if (u->resp_headers_done) {
+        /* every byte in this slab is response body */
+        u->resp_body_remaining = (slab->size >= u->resp_body_remaining)
+                                 ? 0 : (u->resp_body_remaining - slab->size);
+        return NGX_OK;
+    }
+
+    u_char *sep = (u_char *) ngx_strstr(slab->buffer_start,
+                                        HEADER_BODY_SEPARATOR);
+    if (sep == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, u->log, 0,
+                      "response headers span more than one packet");
+        return NGX_ERROR;
+    }
+
+    /*
+     * Bodyless statuses: the status code follows the first space of the
+     * status line ("HTTP/1.x <code> ..."). 204/304 have no body and may omit
+     * Content-Length, so frame them on the status code alone.
+     */
+    u_char *status = (u_char *) ngx_strlchr(slab->buffer_start, sep, ' ');
+    if (status != NULL) {
+        ngx_int_t code = ngx_atoi(status + 1, 3);
+        if (code == 204 || code == 304) {
+            u->resp_headers_done = 1;
+            u->resp_body_remaining = 0;
+            return NGX_OK;
+        }
+    }
+
+    u_char *header_loc = ngx_strlcasestrn(
+        slab->buffer_start, slab->buffer_start + slab->size,
+        (u_char *) RESP_LENGTH_HEADER, sizeof(RESP_LENGTH_HEADER) - 2);
+
+    if (header_loc == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, u->log, 0,
+                      "response missing Content-Length");
+        return NGX_ERROR;
+    }
+
+    u_char *runner = header_loc + (sizeof(RESP_LENGTH_HEADER) - 1);
+    u_char *start  = runner;
+
+    while (*runner != '\r' && *runner != '\n') {
+        ++runner;
+    }
+
+    ssize_t content_length = ngx_atosz(start, runner - start);
+    if (content_length < 0) {
+        ngx_log_error(NGX_LOG_ALERT, u->log, 0,
+                      "response Content-Length value invalid");
+        return NGX_ERROR;
+    }
+
+    size_t header_bytes = (sep + HEADER_BODY_SEPARATOR_SIZE) - slab->buffer_start;
+    size_t body_in_slab = slab->size - header_bytes;
+
+    u->resp_headers_done = 1;
+    u->resp_body_remaining = (body_in_slab >= (size_t) content_length)
+                             ? 0 : ((size_t) content_length - body_in_slab);
+
+    return NGX_OK;
+}
+
 void httplite_send_response_to_client(ngx_event_t *ev) {
     httplite_event_data_t *ev_data = ev->data;
     httplite_upstream_t *u = ev_data->upstream;
@@ -500,50 +617,75 @@ void httplite_send_response_to_client(ngx_event_t *ev) {
         return;
     }
 
-    // current slab fully sent — check if upstream has more data
-    if (c->read->ready) {
-        ssize_t n = c->recv(c, response->buffer_start, SLAB_SIZE);
+    // current slab fully sent — is the whole response forwarded?
+    // Completion is driven by Content-Length accounting, not socket
+    // readiness: resp_body_remaining is the body still to arrive from the
+    // upstream (decremented in httplite_account_response_bytes on each recv).
+    if (!(u->resp_headers_done && u->resp_body_remaining == 0)) {
+        // more body bytes expected — read the next chunk from the upstream
+        if (c->read->ready) {
+            ssize_t n = c->recv(c, response->buffer_start, SLAB_SIZE);
 
-        if (n > 0) {
-            // more response data available, send it
-            response->buffer_pos = response->buffer_start;
-            response->size = n;
-            u->response = response;
+            if (n > 0) {
+                response->buffer_pos = response->buffer_start;
+                response->size = n;
+                response->buffer_start[n] = '\0';
+                u->response = response;
 
-            if (client->write->ready) {
-                httplite_send_response_to_client(ev);
-            } else {
-                ev->handler = httplite_send_response_to_client;
-
-                // Store event and context for the write handler
-                u->pending_response_event = ev;
-                httplite_client_data_t *client_data = client->data;
-                client_data->response_upstream = u;
-
-                // Set write handler and register write interest
-                client->write->handler = httplite_client_response_write_handler;
-                if (ngx_handle_write_event(client->write, 0) != NGX_OK) {
-                    httplite_close_connection(client);
+                if (httplite_account_response_bytes(u, response) != NGX_OK) {
+                    httplite_send_client_error(client, HTTP_INACTIVE_UPSTREAM_RESPONSE);
                     httplite_deactivate_upstream(u);
                     ngx_pfree(u->pool, ev);
                     return;
                 }
-                ngx_add_timer(client->write, 1000);
+
+                if (client->write->ready) {
+                    httplite_send_response_to_client(ev);
+                } else {
+                    ev->handler = httplite_send_response_to_client;
+
+                    // Store event and context for the write handler
+                    u->pending_response_event = ev;
+                    httplite_client_data_t *client_data = client->data;
+                    client_data->response_upstream = u;
+
+                    // Set write handler and register write interest
+                    client->write->handler = httplite_client_response_write_handler;
+                    if (ngx_handle_write_event(client->write, 0) != NGX_OK) {
+                        httplite_close_connection(client);
+                        httplite_deactivate_upstream(u);
+                        ngx_pfree(u->pool, ev);
+                        return;
+                    }
+                    ngx_add_timer(client->write, 1000);
+                }
+                return;
             }
-            return;
+
+            if (n == 0) {
+                // upstream closed mid-response
+                httplite_deactivate_upstream(u);
+                ngx_pfree(u->pool, ev);
+                return;
+            }
+
+            // n == NGX_AGAIN or NGX_ERROR: fall through to wait for more
         }
 
-        if (n == 0) {
-            // upstream closed the connection
+        // body incomplete and socket not ready — keep the upstream busy and
+        // wait for the next read event (httplite_upstream_read_handler stays
+        // installed); do NOT transition to keepalive yet.
+        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+            httplite_close_connection(client);
             httplite_deactivate_upstream(u);
             ngx_pfree(u->pool, ev);
             return;
         }
-
-        // n == NGX_AGAIN or NGX_ERROR: fall through to finish
+        ngx_pfree(u->pool, ev);
+        return;
     }
 
-    // no more data from upstream — transition to keepalive
+    // full response forwarded — transition to keepalive
     c->write->handler = httplite_keepalive_write_handler;
     c->read->handler = httplite_keepalive_read_handler;
     u->busy = 0;
@@ -649,7 +791,7 @@ void httplite_upstream_read_handler(ngx_event_t *rev) {
         return;
     }
 
-    response->buffer_start = ngx_pnalloc(client->pool, SLAB_SIZE);
+    response->buffer_start = ngx_pnalloc(client->pool, SLAB_SIZE + 1);
     if (!response->buffer_start) {
         ngx_log_error(NGX_LOG_ERR, client->log, 0,
                       "unable to allocate response buffer");
@@ -682,8 +824,18 @@ void httplite_upstream_read_handler(ngx_event_t *rev) {
     }
 
     response->size = n;
+    /* NUL-terminate so ngx_strstr in framing accounting stays in bounds */
+    response->buffer_start[n] = '\0';
 
     u->response = response;
+
+    /* parse Content-Length / track body bytes so we know when the
+     * response is fully forwarded (see httplite_send_response_to_client) */
+    if (httplite_account_response_bytes(u, response) != NGX_OK) {
+        httplite_send_client_error(client, HTTP_INACTIVE_UPSTREAM_RESPONSE);
+        httplite_deactivate_upstream(u);
+        return;
+    }
 
     ngx_event_t *event = ngx_pcalloc(u->pool, sizeof(ngx_event_t));
     event->data = u->data;
@@ -781,6 +933,7 @@ void httplite_upstream_write_handler(ngx_event_t *wev) {
 
     if (n == NGX_ERROR) {
         ngx_log_error(NGX_LOG_WARN, wev->log, 0, "unable to send request to upstream %s!", u->peer.name->data);
+        httplite_send_client_error(ev_data->client, HTTP_INACTIVE_UPSTREAM_RESPONSE);
         httplite_deactivate_upstream(u);
         return;
     }
