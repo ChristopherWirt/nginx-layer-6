@@ -26,6 +26,8 @@ typedef struct httplite_upstream_s {
     int                         active;
     int                         pending_active;
     int                         busy;
+    int                         resp_headers_done;       /* have we parsed \r\n\r\n for the current response */
+    size_t                      resp_body_remaining;     /* response body bytes still to forward to the client */
 } httplite_upstream_t;
 
 typedef struct {
