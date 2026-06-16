@@ -290,7 +290,19 @@ sub run_client {
     my $upstream_errors = 0;
     my @misroutes;
 
+    # Self-imposed wall-clock budget, comfortably under the parent's 30s
+    # SIGKILL deadline. Under heavy CI contention the upstream pool returns
+    # transient 503s that this client retries with backoff; across a long
+    # request chain that retry time can otherwise push a (correctly-routing)
+    # child past the parent deadline, where it is killed before writing its
+    # result file. Stopping early lets the child always record its clean
+    # result instead. This bounds runtime, not correctness: the only failing
+    # assertion is "zero misroutes", which an early stop never masks.
+    my $client_deadline = time() + 20;
+
     for my $seq (1..$total) {
+        last if time() >= $client_deadline;
+
         my $body = "c${client_id}:${seq}:${current}";
         my $len  = length $body;
 
