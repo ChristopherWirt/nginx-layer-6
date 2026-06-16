@@ -139,7 +139,8 @@ TODO: {
 
 ###############################################################################
 # POST-007: POST with Content-Length: 0
-# BUG-POST007: Server hangs on zero-length POST body, no response sent
+# A zero-length body ends exactly at the header separator, the same edge case
+# as a bodyless GET. The splitter must still parse and forward it.
 ###############################################################################
 
 {
@@ -147,11 +148,8 @@ TODO: {
     my $url  = $t->base_url();
     my $resp = $ua->post("$url/", Content => '', 'Content-Type' => 'application/x-www-form-urlencoded');
 
-TODO: {
-    local $TODO = 'BUG-POST007: Zero-length POST body causes timeout';
     ok($resp->is_success,
         'POST-007: POST with Content-Length: 0 - 200 response');
-}
 }
 
 ###############################################################################
