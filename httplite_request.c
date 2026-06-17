@@ -387,7 +387,16 @@ void httplite_split_request(httplite_client_data_t *request_data, ngx_connection
         request_data->write_list = request_data->write_list_tail;
     }
 
-    while (read_slab->buffer_pos != read_slab->buffer_start + read_slab->size) {
+    /*
+     * Drive the state machine while there are read-slab bytes left to
+     * consume.  Step 1 (method parse) is the exception: it works off the
+     * staged header block, not the read slab, so it must also run when the
+     * read slab is already exhausted -- otherwise a request that ends exactly
+     * at the header separator (a bodyless GET, or a Content-Length: 0 POST)
+     * is staged but never parsed or forwarded, and the client hangs.
+     */
+    while (read_slab->buffer_pos != read_slab->buffer_start + read_slab->size
+           || request_data->step_number == 1) {
         int result;
 
         switch (request_data->step_number) {
